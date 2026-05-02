@@ -46,7 +46,9 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 from telegram.constants import ParseMode
 
@@ -376,8 +378,8 @@ def format_email_message(msg: dict) -> str:
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     [
-        [KeyboardButton("/newmail"), KeyboardButton("/mymail")],
-        [KeyboardButton("/check"), KeyboardButton("/history")],
+        [KeyboardButton("🔄 New Email"), KeyboardButton("📬 My Email")],
+        [KeyboardButton("🔍 Check Inbox"), KeyboardButton("📜 History")],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -394,7 +396,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"📬 You already have an active email:\n\n"
             f"<code>{existing}</code>\n\n"
-            f"📋 Tap to copy! Emails sent here will appear in this chat.",
+            f"📋 Tap to copy! Emails sent here will appear in this chat.\n\n"
+            f"💡 Want a custom name? Type:\n"
+            f"<code>/custom yourname</code>",
             parse_mode=ParseMode.HTML,
             reply_markup=MAIN_KEYBOARD,
         )
@@ -410,7 +414,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎉 <b>Your Temp Email is Ready!</b>\n\n"
         f"📧 <code>{email}</code>\n\n"
         f"📋 Tap to copy! Any email sent to this address will appear here.\n\n"
-        f"Use the buttons below to manage your inbox ⬇️",
+        f"💡 Want a custom name? Type:\n"
+        f"<code>/custom yourname</code>",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_KEYBOARD,
     )
@@ -648,6 +653,26 @@ def main():
     app.add_handler(CommandHandler("mymail", cmd_mymail))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("history", cmd_history))
+
+    # Route keyboard button taps to commands
+    BUTTON_MAP = {
+        "🔄 New Email": cmd_newmail,
+        "📬 My Email": cmd_mymail,
+        "🔍 Check Inbox": cmd_check,
+        "📜 History": cmd_history,
+    }
+
+    async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        handler = BUTTON_MAP.get(update.message.text)
+        if handler:
+            await handler(update, context)
+
+    app.add_handler(MessageHandler(
+        filters.TEXT & filters.Regex(
+            "^(" + "|".join(re.escape(k) for k in BUTTON_MAP) + ")$"
+        ),
+        handle_button,
+    ))
 
     # Set up auto-polling job (every POLL_INTERVAL seconds)
     app.job_queue.run_repeating(poll_gmail, interval=POLL_INTERVAL, first=5)
