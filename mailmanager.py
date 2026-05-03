@@ -241,6 +241,36 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+def extract_links_from_html(html_text: str) -> list[tuple[str, str]]:
+    """Extract all <a href="..."> links from HTML and return as (label, url) tuples."""
+    links = []
+    seen_urls = set()
+    # Match <a ...href="URL"...>LABEL</a>  (handles single or double quotes)
+    for match in re.finditer(
+        r'<a\s[^>]*href=["\']([^"\'>]+)["\'][^>]*>(.*?)</a>',
+        html_text,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        url = html_module.unescape(match.group(1)).strip()
+        # Skip mailto:, tel:, javascript:, anchors, and data URIs
+        if not url or url.startswith(("mailto:", "tel:", "javascript:", "#", "data:")):
+            continue
+        # De-duplicate by URL
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        # Clean up the label: strip inner HTML tags, unescape, and trim
+        raw_label = re.sub(r"<[^>]+>", "", match.group(2))
+        label = html_module.unescape(raw_label).strip()
+        if not label:
+            label = url[:60]  # fallback to the URL itself
+        # Telegram button labels max 64 chars
+        if len(label) > 64:
+            label = label[:61] + "..."
+        links.append((label, url))
+    return links
+
+
 def strip_html(html_text: str) -> str:
     text = re.sub(r"<br\s*/?>", "\n", html_text, flags=re.IGNORECASE)
     text = re.sub(r"<[^>]+>", "", text)
@@ -248,14 +278,17 @@ def strip_html(html_text: str) -> str:
     return text.strip()
 
 
-def decode_body(payload: dict) -> str:
+def decode_body(payload: dict) -> tuple[str, str]:
+    """Decode the email body. Returns (plain_text, raw_html).
+    raw_html is the original HTML source (empty string if not available).
+    """
     mime_type = payload.get("mimeType", "")
 
     if "body" in payload and payload["body"].get("data"):
         raw = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
         if "html" in mime_type:
-            return strip_html(raw)
-        return raw
+            return strip_html(raw), raw
+        return raw, ""
 
     parts = payload.get("parts", [])
     plain_parts, html_parts = [], []
@@ -265,9 +298,11 @@ def decode_body(payload: dict) -> str:
         if part.get("filename"):
             continue
         if part_mime.startswith("multipart/"):
-            nested = decode_body(part)
-            if nested:
-                plain_parts.append(nested)
+            nested_text, nested_html = decode_body(part)
+            if nested_text:
+                plain_parts.append(nested_text)
+            if nested_html:
+                html_parts.append(nested_html)
             continue
         data = part.get("body", {}).get("data", "")
         if not data:
@@ -278,11 +313,12 @@ def decode_body(payload: dict) -> str:
         elif part_mime == "text/html":
             html_parts.append(decoded)
 
+    raw_html = "\n".join(html_parts) if html_parts else ""
     if plain_parts:
-        return "\n".join(plain_parts).strip()
+        return "\n".join(plain_parts).strip(), raw_html
     elif html_parts:
-        return strip_html("\n".join(html_parts))
-    return ""
+        return strip_html(raw_html), raw_html
+    return "", ""
 
 
 def get_header(headers: list, name: str) -> str:
@@ -349,8 +385,11 @@ def escape_md(text: str) -> str:
     return re.sub(f"([{re.escape(special)}])", r"\\\1", text)
 
 
-def format_email_message(msg: dict) -> str:
-    """Format an email into a nice Telegram message."""
+def format_email_message(msg: dict) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Format an email into a nice Telegram message + inline link buttons.
+
+    Returns (text, reply_markup).  reply_markup is None when there are no links.
+    """
     headers = msg.get("payload", {}).get("headers", [])
     payload = msg.get("payload", {})
 
@@ -358,9 +397,12 @@ def format_email_message(msg: dict) -> str:
     subject   = get_header(headers, "Subject") or "(No Subject)"
     date_str  = get_header(headers, "Date")
 
-    body = decode_body(payload)
+    body, raw_html = decode_body(payload)
     if len(body) > 2000:
         body = body[:2000] + "\n... [truncated]"
+
+    # Extract clickable links from the HTML source
+    links = extract_links_from_html(raw_html) if raw_html else []
 
     text = (
         f"📩 <b>New Email Received!</b>\n"
@@ -371,7 +413,20 @@ def format_email_message(msg: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         f"<pre>{html_module.escape(body)}</pre>"
     )
-    return text
+
+    # Build InlineKeyboard with one URL button per link (max 20 to stay safe)
+    reply_markup = None
+    if links:
+        buttons = []
+        for label, url in links[:20]:
+            try:
+                buttons.append([InlineKeyboardButton(text=label, url=url)])
+            except Exception:
+                pass  # skip malformed URLs
+        if buttons:
+            reply_markup = InlineKeyboardMarkup(buttons)
+
+    return text, reply_markup
 
 
 # ─── Persistent Keyboard ─────────────────────────────────────────────────────
@@ -529,10 +584,11 @@ async def cmd_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not msg:
             continue
 
-        text = format_email_message(msg)
+        text, reply_markup = format_email_message(msg)
         try:
             await context.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
             )
             db_mark_seen(msg_info["id"], chat_id)
             new_count += 1
@@ -574,10 +630,11 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not msg:
             continue
 
-        text = format_email_message(msg)
+        text, reply_markup = format_email_message(msg)
         try:
             await context.bot.send_message(
-                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
             )
             db_mark_seen(msg_info["id"], chat_id)
         except Exception as e:
@@ -610,10 +667,11 @@ async def poll_gmail(context: ContextTypes.DEFAULT_TYPE):
                 if not msg:
                     continue
 
-                text = format_email_message(msg)
+                text, reply_markup = format_email_message(msg)
                 try:
                     await context.bot.send_message(
-                        chat_id=chat_id, text=text, parse_mode=ParseMode.HTML
+                        chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                        reply_markup=reply_markup,
                     )
                     db_mark_seen(msg_info["id"], chat_id)
                     log.info(f"📩 Delivered email to {chat_id} ({email})")
